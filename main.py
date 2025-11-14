@@ -102,6 +102,16 @@ def fl_finetune(
     mode: str = "full_sa",   # ["full_sa", "freeze_A"]
     A_path: str = "",        # freeze_A 模式下加载 A_global 的路径
 ):
+    
+    # ------ force convert command-line Fire inputs ------
+    num_clients = int(num_clients)
+    num_communication_rounds = int(num_communication_rounds)
+    client_selection_frac = float(client_selection_frac)
+    local_batch_size = int(local_batch_size)
+    local_micro_batch_size = int(local_micro_batch_size)
+    local_num_epochs = int(local_num_epochs)
+    local_learning_rate = float(local_learning_rate)
+    local_val_set_size = int(local_val_set_size)
 
     # ===========================================================
     # Print basic info
