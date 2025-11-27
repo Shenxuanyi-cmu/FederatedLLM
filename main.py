@@ -1,40 +1,69 @@
 import os
 from typing import List
-from tqdm import tqdm
 import fire
 import torch
+from tqdm.auto import tqdm
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
 )
 
-# 🔧 peft
+# 🔧 PEFT
 from peft import (
     LoraConfig,
     get_peft_model,
     prepare_model_for_kbit_training,
 )
 
-# federated utils
+# Federated utils
 from fed_utils import FedAvg, client_selection, global_evaluation, GeneralClient
 from utils.prompter import Prompter
 
 import glob
 import copy
+import datasets
 
-HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or "hf_xxxxxx"
+
+# ===========================================================
+# 🌟 Patch datasets.map() to use a clean tqdm progress bar
+# ===========================================================
+def tqdm_clean(total=None, desc=None):
+    return tqdm(
+        total=total,
+        desc=desc,
+        dynamic_ncols=True,
+        mininterval=0.1,
+        smoothing=0.2,
+        leave=False,
+    )
+
+datasets.tqdm = tqdm_clean  # 覆盖 datasets 默认多行刷屏行为
 
 
+# ===========================================================
+# HF Token
+# ===========================================================
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or "hf_xxx"
+if HF_TOKEN is None:
+    print("⚠️ Warning: HF_TOKEN not found in environment variables.")
+
+
+# ===========================================================
+# Freeze-A helpers
+# ===========================================================
 def freeze_lora_A(model):
-    """Freeze LoRA A matrices only."""
+    """Freeze all LoRA A matrices (train only B)."""
     for name, param in model.named_parameters():
         if "lora_A" in name:
             param.requires_grad = False
 
 
+# ===========================================================
+# Main FL logic
+# ===========================================================
 def fl_finetune(
-    # basic params
+    # Basic Params
     global_model: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     data_path: str = "./data_wiz",
     output_dir: str = "./runs/FLoRA-modern/",
@@ -45,7 +74,7 @@ def fl_finetune(
     num_communication_rounds: int = 3,
     num_clients: int = 10,
 
-    # local training params
+    # Local training params
     local_batch_size: int = 128,
     local_micro_batch_size: int = 16,
     local_num_epochs: int = 1,
@@ -53,29 +82,29 @@ def fl_finetune(
     local_val_set_size: int = 0,
     cutoff_len: int = 512,
 
-    # LoRA params
+    # LoRA params (LLaMA 系列使用 q/k/v/o)
     lora_r: int = 16,
     lora_alpha: int = 32,
     lora_dropout: float = 0.05,
-    lora_target_modules: List[str] = ("q_proj", "v_proj"),
+    lora_target_modules: List[str] = ("q_proj", "k_proj", "v_proj", "o_proj"),
 
-    # llm settings
+    # LLM settings
     group_by_length: bool = False,
     prompt_template_name: str = "alpaca",
 
-    # aggregation mode
+    # Aggregation mode
     stacking: bool = False,
 
-    # eval
+    # Evaluation
     dev_data_path: str = "./mmlu_test_1444.jsonl",
 
-    # heterogeneous
+    # Heterogeneous FL
     heter: bool = False,
     local_ranks: List[int] = (64, 32, 16, 16, 8, 8, 4, 4, 4, 4),
     zero_padding: bool = False,
     full: bool = False,
 
-    # NEW: freeze A after N rounds
+    # Freeze A after N rounds
     freezeA_after_rounds: int = -1,
 ):
 
@@ -86,25 +115,27 @@ def fl_finetune(
     print(f"🚀 Starting FL + LoRA, Freeze-A at round {freezeA_after_rounds}")
 
     # ===========================================================
-    # Dataset auto-select
+    # Auto-select dataset folder
     # ===========================================================
     subdirs = [d for d in os.listdir(data_path) if d.isdigit()]
     if subdirs:
-        data_path = os.path.join(data_path, max(subdirs, key=int))
+        max_subdir = max(subdirs, key=int)
+        data_path = os.path.join(data_path, max_subdir)
 
-    assert os.path.exists(data_path)
+    assert os.path.exists(data_path), f"❌ Missing data folder {data_path}"
 
     all_client_files = sorted(glob.glob(os.path.join(data_path, "local_training_*.json")))
     num_clients = min(num_clients, len(all_client_files))
     print(f"📦 Using {num_clients} clients")
 
     # ===========================================================
-    # Model
+    # Model init
     # ===========================================================
     prompter = Prompter(prompt_template_name)
     gradient_accumulation_steps = local_batch_size // local_micro_batch_size
 
     quant_config = BitsAndBytesConfig(load_in_8bit=True)
+
     model = AutoModelForCausalLM.from_pretrained(
         global_model,
         device_map="auto",
@@ -118,7 +149,6 @@ def fl_finetune(
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
 
-    # tokenizer wrapper
     def tokenize(prompt, add_eos_token=True):
         r = tokenizer(prompt, truncation=True, max_length=cutoff_len,
                       padding=False, return_tensors=None)
@@ -131,16 +161,17 @@ def fl_finetune(
 
     def generate_and_tokenize_prompt(dp):
         if "context" in dp:
-            p = prompter.generate_prompt(dp["instruction"], dp["context"], dp["output"])
+            prompt_text = prompter.generate_prompt(
+                dp.get("instruction", ""), dp.get("context", ""), dp.get("output", "")
+            )
         else:
-            p = prompter.generate_prompt(dp["instruction"], dp["input"], dp["output"])
-        return tokenize(p)
+            prompt_text = prompter.generate_prompt(
+                dp.get("instruction", ""), dp.get("input", ""), dp.get("output", "")
+            )
+        return tokenize(prompt_text)
 
-    # ===========================================================
-    # LoRA init
-    # ===========================================================
+    # LoRA (LLaMA q/k/v/o)
     model = prepare_model_for_kbit_training(model)
-
     if not full and not stacking:
         config = LoraConfig(
             base_model_name_or_path=global_model,
@@ -154,38 +185,45 @@ def fl_finetune(
         model = get_peft_model(model, config)
 
     # ===========================================================
-    # Output
+    # Output folder
     # ===========================================================
     output_dir = os.path.join(output_dir, str(num_clients))
     os.makedirs(output_dir, exist_ok=True)
 
     # ===========================================================
-    # FL Rounds
+    # Federated Learning rounds
     # ===========================================================
     acc_list = []
     local_dataset_len_dict = {}
-    prev_clients = set()
+    previously_selected_clients_set = set()
+    last_client_id = None
 
-    for epoch in tqdm(range(num_communication_rounds), desc="🚀 FL Progress"):
+    for epoch in range(num_communication_rounds):
         print(f"\n🔥 Round {epoch}")
 
         freezeA_phase = (freezeA_after_rounds >= 0 and epoch >= freezeA_after_rounds)
         if freezeA_phase:
-            print("🔒 Freeze-A phase active")
+            print("🔒 Freeze-A phase ON (only training B)")
 
-        # client selection
-        selected = client_selection(num_clients, client_selection_frac,
-                                    client_selection_strategy, other_info=epoch)
+        selected_clients_set = client_selection(
+            num_clients, client_selection_frac, client_selection_strategy, other_info=epoch
+        )
 
-        # local train
-        for cid in selected:
+        # ================== Local training ==================
+        for cid in selected_clients_set:
             model_client = copy.deepcopy(model)
 
             if freezeA_phase:
                 freeze_lora_A(model_client)
 
-            client = GeneralClient(cid, model_client, data_path, output_dir, freezeA_phase)
-            client.preprare_local_dataset(generate_and_tokenize_prompt, local_val_set_size, use_tqdm=True)
+            client = GeneralClient(cid, model_client, data_path, output_dir)
+
+            # ⭐ 使用 tqdm 的 map
+            client.preprare_local_dataset(
+                generate_and_tokenize_prompt,
+                local_val_set_size,
+                use_tqdm=True  # 你需要确保 GeneralClient 支持这个参数
+            )
 
             client.build_local_trainer(
                 tokenizer,
@@ -198,29 +236,42 @@ def fl_finetune(
             )
 
             client.initiate_local_training()
-            client.train()
+            client.train()  # Trainer 自带动态 tqdm
 
-            (model_client,
-             local_dataset_len_dict,
-             prev_clients,
-             last_id) = client.terminate_local_training(
-                epoch, local_dataset_len_dict, prev_clients
+            (
+                model_client,
+                local_dataset_len_dict,
+                previously_selected_clients_set,
+                last_client_id
+            ) = client.terminate_local_training(
+                epoch, local_dataset_len_dict, previously_selected_clients_set
             )
 
-        # aggregation
+            del client
+
+        # ================== FedAvg aggregation ==================
         print("📦 FedAvg aggregation...")
         model = FedAvg(
-            model, selected, output_dir, local_dataset_len_dict, epoch,
-            stacking, lora_r, heter, list(local_ranks), zero_padding, full,
-            freezeA_phase=freezeA_phase
+            model,
+            selected_clients_set,
+            output_dir,
+            local_dataset_len_dict,
+            epoch,
+            stacking,
+            lora_r,
+            heter,
+            list(local_ranks),
+            zero_padding,
+            full,
+            freezeA_phase=freezeA_phase,
         )
 
-        # eval
+        # ================== Evaluation ==================
         acc = global_evaluation(model, tokenizer, prompter, dev_data_path)
         acc_list.append(acc)
         print(f"📊 Acc epoch {epoch}: {acc}")
 
-    # save log
+    # Save log
     with open(os.path.join(output_dir, "log.txt"), "a") as f:
         for a in acc_list:
             f.write(str(a) + "\n")
@@ -228,5 +279,8 @@ def fl_finetune(
     print("🎉 FL training finished!")
 
 
+# ===========================================================
+# Fire interface
+# ===========================================================
 if __name__ == "__main__":
     fire.Fire(fl_finetune)
