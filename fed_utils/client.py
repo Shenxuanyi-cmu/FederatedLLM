@@ -8,13 +8,11 @@ from peft import (
     get_peft_model_state_dict,
     set_peft_model_state_dict,
 )
+from tqdm import tqdm
 
 
 class GeneralClient:
     def __init__(self, client_id, model, data_path, output_dir, freezeA_phase=False):
-        """
-        freezeA_phase: True -> do NOT train lora_A (A matrices are frozen)
-        """
         self.client_id = client_id
         self.model = model
         self.freezeA_phase = freezeA_phase
@@ -23,32 +21,51 @@ class GeneralClient:
         self.local_data = load_dataset("json", data_files=self.local_data_path)
 
         self.output_dir = output_dir
-        self.local_output_dir = os.path.join(
-            self.output_dir, "trainer_saved", f"local_output_{self.client_id}"
-        )
+        self.local_output_dir = os.path.join(output_dir, "trainer_saved", f"local_output_{self.client_id}")
 
     # ===========================================================
     # dataset
     # ===========================================================
-    def preprare_local_dataset(self, generate_and_tokenize_prompt, local_val_set_size):
+    def preprare_local_dataset(self, generate_and_tokenize_prompt, local_val_set_size, use_tqdm=True):
+
+        def map_with_tqdm(dataset, desc):
+            total = len(dataset)
+            pbar = tqdm(total=total, desc=desc, disable=not use_tqdm)
+
+            def wrapper(example):
+                pbar.update(1)
+                return generate_and_tokenize_prompt(example)
+
+            mapped = dataset.map(wrapper)
+            pbar.close()
+            return mapped
+
         if local_val_set_size > 0:
-            local_train_val = self.local_data["train"].train_test_split(
+            split = self.local_data["train"].train_test_split(
                 test_size=local_val_set_size, shuffle=True, seed=42
             )
-            self.local_train_dataset = (
-                local_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+
+            self.local_train_dataset = map_with_tqdm(
+                split["train"].shuffle(),
+                desc=f"Client {self.client_id} tokenize(train)"
             )
-            self.local_eval_dataset = (
-                local_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+
+            self.local_eval_dataset = map_with_tqdm(
+                split["test"].shuffle(),
+                desc=f"Client {self.client_id} tokenize(eval)"
             )
+
         else:
-            self.local_train_dataset = self.local_data["train"].shuffle().map(generate_and_tokenize_prompt)
+            self.local_train_dataset = map_with_tqdm(
+                self.local_data["train"].shuffle(),
+                desc=f"Client {self.client_id} tokenize"
+            )
             self.local_eval_dataset = None
 
         self.local_val_set_size = local_val_set_size
 
     # ===========================================================
-    # build trainer
+    # Trainer
     # ===========================================================
     def build_local_trainer(
         self,
@@ -61,7 +78,6 @@ class GeneralClient:
         ddp,
     ):
 
-        # ⭐ NEW: freeze A (double insurance)
         if self.freezeA_phase:
             for name, param in self.model.named_parameters():
                 if "lora_A" in name:
@@ -98,13 +114,10 @@ class GeneralClient:
             ),
         )
 
-    # ===========================================================
-    # override model.state_dict to return only LoRA weights
-    # ===========================================================
+    # -----------------------------------------------------------
     def initiate_local_training(self):
         self.model.config.use_cache = False
 
-        # store old adapter params to reset later
         self.params_dict_old = copy.deepcopy(
             OrderedDict(
                 (name, p.detach())
@@ -112,44 +125,36 @@ class GeneralClient:
                 if "default" in name
             )
         )
+
         self.params_dict_new = OrderedDict(
             (name, p.detach())
             for name, p in self.model.named_parameters()
             if "default" in name
         )
 
-        # override state_dict to return new adapter weights
         self.model.state_dict = (
             lambda instance, *_, **__: get_peft_model_state_dict(
                 instance, self.params_dict_new, "default"
             )
         ).__get__(self.model, type(self.model))
 
-    # ===========================================================
+    # -----------------------------------------------------------
     def train(self):
         self.local_trainer.train()
 
-    # ===========================================================
-    # save local client update, reset model
-    # ===========================================================
+    # -----------------------------------------------------------
     def terminate_local_training(self, epoch, local_dataset_len_dict, previously_selected_clients_set):
 
-        # number of samples
         local_dataset_len_dict[self.client_id] = len(self.local_train_dataset)
 
-        # new adapter weights ONLY
         new_adapter_weight = self.model.state_dict()
 
-        # save
-        single_output_dir = os.path.join(self.output_dir, str(epoch), f"local_output_{self.client_id}")
-        os.makedirs(single_output_dir, exist_ok=True)
-        torch.save(new_adapter_weight, single_output_dir + "/pytorch_model.bin")
+        save_dir = os.path.join(self.output_dir, str(epoch), f"local_output_{self.client_id}")
+        os.makedirs(save_dir, exist_ok=True)
+        torch.save(new_adapter_weight, os.path.join(save_dir, "pytorch_model.bin"))
 
-        # reset adapter weights to old ones
-        older_adapter_weight = get_peft_model_state_dict(self.model, self.params_dict_old, "default")
-        set_peft_model_state_dict(self.model, older_adapter_weight, "default")
+        old_weight = get_peft_model_state_dict(self.model, self.params_dict_old, "default")
+        set_peft_model_state_dict(self.model, old_weight, "default")
 
-        previously_selected_clients_set = previously_selected_clients_set | set({self.client_id})
-        last_client_id = self.client_id
-
-        return self.model, local_dataset_len_dict, previously_selected_clients_set, last_client_id
+        previously_selected_clients_set = previously_selected_clients_set | {self.client_id}
+        return self.model, local_dataset_len_dict, previously_selected_clients_set, self.client_id

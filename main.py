@@ -14,7 +14,6 @@ from peft import (
     LoraConfig,
     get_peft_model,
     prepare_model_for_kbit_training,
-    PeftModel,
 )
 
 # federated utils
@@ -24,24 +23,16 @@ from utils.prompter import Prompter
 import glob
 import copy
 
-HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
-if HF_TOKEN is None:
-    print("⚠️ Warning: HF_TOKEN not found in environment variables.")
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or "hf_xxxxxx"
 
 
-# ===========================================================
-# Freeze-A helpers
-# ===========================================================
 def freeze_lora_A(model):
-    """Freeze all lora_A parameters so only B is trainable."""
+    """Freeze LoRA A matrices only."""
     for name, param in model.named_parameters():
         if "lora_A" in name:
             param.requires_grad = False
 
 
-# ===========================================================
-# Main FL logic
-# ===========================================================
 def fl_finetune(
     # basic params
     global_model: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
@@ -84,7 +75,7 @@ def fl_finetune(
     zero_padding: bool = False,
     full: bool = False,
 
-    # ⭐ NEW: freeze A after N rounds
+    # NEW: freeze A after N rounds
     freezeA_after_rounds: int = -1,
 ):
 
@@ -95,21 +86,20 @@ def fl_finetune(
     print(f"🚀 Starting FL + LoRA, Freeze-A at round {freezeA_after_rounds}")
 
     # ===========================================================
-    # Auto-select dataset folder
+    # Dataset auto-select
     # ===========================================================
     subdirs = [d for d in os.listdir(data_path) if d.isdigit()]
     if subdirs:
-        max_subdir = max(subdirs, key=int)
-        data_path = os.path.join(data_path, max_subdir)
+        data_path = os.path.join(data_path, max(subdirs, key=int))
 
-    assert os.path.exists(data_path), f"❌ Missing data folder {data_path}"
+    assert os.path.exists(data_path)
 
     all_client_files = sorted(glob.glob(os.path.join(data_path, "local_training_*.json")))
     num_clients = min(num_clients, len(all_client_files))
     print(f"📦 Using {num_clients} clients")
 
     # ===========================================================
-    # Model init
+    # Model
     # ===========================================================
     prompter = Prompter(prompt_template_name)
     gradient_accumulation_steps = local_batch_size // local_micro_batch_size
@@ -128,9 +118,10 @@ def fl_finetune(
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
 
+    # tokenizer wrapper
     def tokenize(prompt, add_eos_token=True):
         r = tokenizer(prompt, truncation=True, max_length=cutoff_len,
-                       padding=False, return_tensors=None)
+                      padding=False, return_tensors=None)
         if add_eos_token and r["input_ids"][-1] != tokenizer.eos_token_id:
             if len(r["input_ids"]) < cutoff_len:
                 r["input_ids"].append(tokenizer.eos_token_id)
@@ -140,17 +131,16 @@ def fl_finetune(
 
     def generate_and_tokenize_prompt(dp):
         if "context" in dp:
-            prompt_text = prompter.generate_prompt(
-                dp.get("instruction",""), dp.get("context",""), dp.get("output","")
-            )
+            p = prompter.generate_prompt(dp["instruction"], dp["context"], dp["output"])
         else:
-            prompt_text = prompter.generate_prompt(
-                dp.get("instruction",""), dp.get("input",""), dp.get("output","")
-            )
-        return tokenize(prompt_text)
+            p = prompter.generate_prompt(dp["instruction"], dp["input"], dp["output"])
+        return tokenize(p)
 
-    # LoRA
+    # ===========================================================
+    # LoRA init
+    # ===========================================================
     model = prepare_model_for_kbit_training(model)
+
     if not full and not stacking:
         config = LoraConfig(
             base_model_name_or_path=global_model,
@@ -164,41 +154,39 @@ def fl_finetune(
         model = get_peft_model(model, config)
 
     # ===========================================================
-    # Output folder
+    # Output
     # ===========================================================
     output_dir = os.path.join(output_dir, str(num_clients))
     os.makedirs(output_dir, exist_ok=True)
 
     # ===========================================================
-    # FL rounds
+    # FL Rounds
     # ===========================================================
     acc_list = []
     local_dataset_len_dict = {}
-    previously_selected_clients_set = set()
-    last_client_id = None
+    prev_clients = set()
 
-    for epoch in tqdm(range(num_communication_rounds)):
+    for epoch in tqdm(range(num_communication_rounds), desc="🚀 FL Progress"):
         print(f"\n🔥 Round {epoch}")
 
-        # ⭐ 判断当前是否在冻结 A 的阶段
         freezeA_phase = (freezeA_after_rounds >= 0 and epoch >= freezeA_after_rounds)
         if freezeA_phase:
-            print("🔒 Freeze-A phase ON (only training B)")
+            print("🔒 Freeze-A phase active")
 
-        selected_clients_set = client_selection(
-            num_clients, client_selection_frac, client_selection_strategy, other_info=epoch
-        )
+        # client selection
+        selected = client_selection(num_clients, client_selection_frac,
+                                    client_selection_strategy, other_info=epoch)
 
-        # ================== local training ==================
-        for cid in selected_clients_set:
+        # local train
+        for cid in selected:
             model_client = copy.deepcopy(model)
 
-            # ⭐ 客户端冻结 A
             if freezeA_phase:
                 freeze_lora_A(model_client)
 
-            client = GeneralClient(cid, model_client, data_path, output_dir)
-            client.preprare_local_dataset(generate_and_tokenize_prompt, local_val_set_size)
+            client = GeneralClient(cid, model_client, data_path, output_dir, freezeA_phase)
+            client.preprare_local_dataset(generate_and_tokenize_prompt, local_val_set_size, use_tqdm=True)
+
             client.build_local_trainer(
                 tokenizer,
                 local_micro_batch_size,
@@ -208,43 +196,31 @@ def fl_finetune(
                 group_by_length,
                 False,
             )
+
             client.initiate_local_training()
             client.train()
-            (
-                model_client, 
-                local_dataset_len_dict,
-                previously_selected_clients_set,
-                last_client_id
-            ) = client.terminate_local_training(
-                epoch, local_dataset_len_dict, previously_selected_clients_set
-            )
-            del client
 
-        # ================== aggregation ==================
+            (model_client,
+             local_dataset_len_dict,
+             prev_clients,
+             last_id) = client.terminate_local_training(
+                epoch, local_dataset_len_dict, prev_clients
+            )
+
+        # aggregation
         print("📦 FedAvg aggregation...")
         model = FedAvg(
-            model,
-            selected_clients_set,
-            output_dir,
-            local_dataset_len_dict,
-            epoch,
-            stacking,
-            lora_r,
-            heter,
-            list(local_ranks),
-            zero_padding,
-            full,
-
-            # ⭐ 新增：让 FedAvg 只聚合 B
-            freezeA_phase=freezeA_phase,
+            model, selected, output_dir, local_dataset_len_dict, epoch,
+            stacking, lora_r, heter, list(local_ranks), zero_padding, full,
+            freezeA_phase=freezeA_phase
         )
 
-        # ================== eval ==================
+        # eval
         acc = global_evaluation(model, tokenizer, prompter, dev_data_path)
         acc_list.append(acc)
         print(f"📊 Acc epoch {epoch}: {acc}")
 
-    # ================== save log ==================
+    # save log
     with open(os.path.join(output_dir, "log.txt"), "a") as f:
         for a in acc_list:
             f.write(str(a) + "\n")
