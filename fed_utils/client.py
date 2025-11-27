@@ -153,4 +153,3 @@ class GeneralClient:
         previously_selected_clients_set = previously_selected_clients_set | {self.client_id}
 
         return self.model, local_dataset_len_dict, previously_selected_clients_set
-
