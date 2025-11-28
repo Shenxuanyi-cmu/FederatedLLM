@@ -103,12 +103,21 @@ def global_evaluation(model, tokenizer, prompter, dev_data_path):
             total_count_dict[class_test_set] += 1
 
     mean_acc = 0.
+    valid_class_count = 0
 
     for key in acc_count_dict.keys():
-        tmp = right_count_dict[key]/total_count_dict[key]
-        mean_acc += tmp
+
+        # skip classes that have zero samples
+        if total_count_dict[key] == 0:
+            acc_count_dict[key] = 0
+            continue
+
+        tmp = right_count_dict[key] / total_count_dict[key]
         acc_count_dict[key] = tmp
-    mean_acc /= len(acc_count_dict.keys())
+        mean_acc += tmp
+        valid_class_count += 1
+
+    mean_acc = mean_acc / valid_class_count if valid_class_count > 0 else 0
     csv_data = [right_count_dict, total_count_dict, acc_count_dict]
 
     '''with open(os.path.join('/ai4bio-store/junbo.li/data_selection/alpaca-lora/raw_dict_mmlu',data_path.split('/')[-1].replace('.json','') + '.csv'), 'w', newline='') as file:
