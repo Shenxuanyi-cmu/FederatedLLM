@@ -4,6 +4,7 @@ from typing import List
 import fire
 import torch
 from tqdm.auto import tqdm
+import wandb
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -73,6 +74,18 @@ def fl_finetune(
 ):
 
     print(f"🚀 FL Training Started. Freeze-A from round ≥ {freezeA_after_rounds}")
+    wandb.init(
+        project="FLoRA-FL",
+        name=f"run_clients{num_clients}_rounds{num_communication_rounds}",
+        config={
+            "clients": num_clients,
+            "rounds": num_communication_rounds,
+            "stacking": stacking,
+            "freezeA_after_rounds": freezeA_after_rounds,
+            "lora_r": lora_r,
+            "cutoff_len": cutoff_len,
+        }
+    )
 
     # auto-select 10/20
     subdirs = [d for d in os.listdir(data_path) if d.isdigit()]
