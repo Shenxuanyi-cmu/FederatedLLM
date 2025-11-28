@@ -226,6 +226,8 @@ def fl_finetune(
         # global eval
         acc = global_evaluation(model, tokenizer, prompter, "./mmlu_test_1444.jsonl")
         print(f"🌟 Acc of Round {epoch}: {acc}")
+        wandb.log({"round": epoch, "accuracy": acc})
+
 
     print("🎉 FL Training Completed!")
 
