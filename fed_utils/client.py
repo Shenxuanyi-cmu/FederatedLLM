@@ -1,4 +1,5 @@
 # fed_utils/client.py
+
 import transformers
 import os
 from datasets import load_dataset
@@ -24,39 +25,17 @@ class GeneralClient:
 
         # output path
         self.output_dir = output_dir
-        self.local_output_dir = os.path.join(output_dir, "trainer_saved", f"local_output_{client_id}")
+        self.local_output_dir = os.path.join(
+            output_dir, "trainer_saved", f"local_output_{client_id}"
+        )
 
     # ===========================================================
-    # dataset prepare
-    # ===========================================================
-    def preprare_local_dataset(self, generate_and_tokenize_prompt, local_val_set_size, use_tqdm=True):
-
-        def map_with_tqdm(ds, desc):
-            total = len(ds)
-            pbar = tqdm(total=total, desc=desc, disable=not use_tqdm)
-
-            def wrapper(x):
-                pbar.update(1)
-                return generate_and_tokenize_prompt(x)
-
-            mapped = ds.map(wrapper)
-            pbar.close()
-            return mapped
-
+    def preprare_local_dataset(self, generate_and_tokenize_prompt, local_val_set_size):
         ds = self.local_data["train"].shuffle()
-
-        if local_val_set_size > 0:
-            split = ds.train_test_split(test_size=local_val_set_size, seed=42)
-            self.local_train_dataset = map_with_tqdm(split["train"], f"Client {self.client_id} tokenize(train)")
-            self.local_eval_dataset = map_with_tqdm(split["test"], f"Client {self.client_id} tokenize(eval)")
-        else:
-            self.local_train_dataset = map_with_tqdm(ds, f"Client {self.client_id} tokenize")
-            self.local_eval_dataset = None
-
+        self.local_train_dataset = ds.map(generate_and_tokenize_prompt)
+        self.local_eval_dataset = None
         self.local_val_set_size = local_val_set_size
 
-    # ===========================================================
-    # Trainer build
     # ===========================================================
     def build_local_trainer(
         self,
@@ -70,11 +49,11 @@ class GeneralClient:
     ):
 
         if self.freezeA_phase:
+            # Freeze only A
             for name, p in self.model.named_parameters():
                 if "lora_A" in name:
                     p.requires_grad = False
 
-        # ❗❗ transformers>=4.46 MUST use evaluation_strategy
         self.train_args = transformers.TrainingArguments(
             per_device_train_batch_size=local_micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
@@ -83,10 +62,7 @@ class GeneralClient:
             fp16=True,
             logging_steps=1,
             optim="adamw_torch",
-
-            # ❌ 禁用 evaluation（FL 不需要）
-            eval_strategy="no",
-
+            eval_strategy="no",   # ✔ confirmed working on 4.46
             save_strategy="no",
             output_dir=self.local_output_dir,
             group_by_length=group_by_length,
@@ -106,50 +82,63 @@ class GeneralClient:
         )
 
     # ===========================================================
-    # Local training init
-    # ===========================================================
     def initiate_local_training(self):
         self.model.config.use_cache = False
 
-        # old LoRA weights backup
-        self.params_dict_old = copy.deepcopy(
-            OrderedDict((n, p.detach()) for n, p in self.model.named_parameters() if "default" in n)
-        )
+        # backup old A/B
+        self.params_dict_old = {
+            n: p.detach().clone()
+            for n, p in self.model.named_parameters()
+            if "default" in n
+        }
 
-        # new LoRA to train
-        self.params_dict_new = OrderedDict(
-            (n, p.detach()) for n, p in self.model.named_parameters() if "default" in n
-        )
-
-        # monkey patch
-        self.model.state_dict = (
-            lambda inst, *_, **__: get_peft_model_state_dict(inst, self.params_dict_new, "default")
-        ).__get__(self.model, type(self.model))
-
-    # ===========================================================
-    # train
     # ===========================================================
     def train(self):
         self.local_trainer.train()
 
+        # ===========================================================
+        # ⭐ DEBUG PRINT A / B norm after local update
+        # ===========================================================
+        A_norm = None
+        B_norm = None
+
+        for name, p in self.model.named_parameters():
+            if "lora_A" in name and A_norm is None:
+                A_norm = p.norm().item()
+            if "lora_B" in name and B_norm is None:
+                B_norm = p.norm().item()
+            if A_norm is not None and B_norm is not None:
+                break
+
+        print(
+            f"[CLIENT {self.client_id}] "
+            f"After Train → A_norm={A_norm:.6f}, B_norm={B_norm:.6f}"
+        )
+
     # ===========================================================
-    # terminate
-    # ===========================================================
-    def terminate_local_training(self, epoch, local_dataset_len_dict, previously_selected_clients_set):
+    def terminate_local_training(self, epoch, local_dataset_len_dict, previously_selected):
 
         local_dataset_len_dict[self.client_id] = len(self.local_train_dataset)
 
-        # trained LoRA
-        new_lora = self.model.state_dict()
+        # obtain trained adapter state
+        trained = get_peft_model_state_dict(self.model, adapter_name="default")
 
+        # upload dict
+        upload_dict = {}
+        for name, tensor in trained.items():
+            if self.freezeA_phase:
+                if "lora_B" in name:   # freeze phase only upload B
+                    upload_dict[name] = tensor.cpu()
+            else:
+                upload_dict[name] = tensor.cpu()
+
+        # save to disk
         save_dir = os.path.join(self.output_dir, str(epoch), f"local_output_{self.client_id}")
         os.makedirs(save_dir, exist_ok=True)
-        torch.save(new_lora, os.path.join(save_dir, "pytorch_model.bin"))
+        torch.save(upload_dict, os.path.join(save_dir, "pytorch_model.bin"))
 
-        # restore old LoRA
-        old_lora = get_peft_model_state_dict(self.model, self.params_dict_old, "default")
-        set_peft_model_state_dict(self.model, old_lora, "default")
+        # restore original A/B
+        set_peft_model_state_dict(self.model, self.params_dict_old, "default")
 
-        previously_selected_clients_set = previously_selected_clients_set | {self.client_id}
-
-        return self.model, local_dataset_len_dict, previously_selected_clients_set
+        previously_selected |= {self.client_id}
+        return self.model, local_dataset_len_dict, previously_selected
