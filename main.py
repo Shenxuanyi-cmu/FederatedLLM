@@ -26,7 +26,7 @@ from utils.prompter import Prompter
 from fed_utils.client import GeneralClient
 from fed_utils.model_aggregation import FedAvg
 from fed_utils.evaluation import global_evaluation
-
+import gc
 
 datasets.tqdm = lambda *args, **kwargs: tqdm(*args, **kwargs, leave=False)
 HF_TOKEN = "hf_xxxxx"
@@ -88,13 +88,12 @@ def fl_finetune(
     # Load global model
     # -----------------------------------------------------------
     prompter = Prompter("alpaca")
-    quant = BitsAndBytesConfig(load_in_8bit=True)
+    quant = None
 
     model = AutoModelForCausalLM.from_pretrained(
         global_model,
         device_map="auto",
         torch_dtype=torch.float16,
-        quantization_config=quant,
         token=HF_TOKEN,
     )
 
@@ -204,6 +203,11 @@ def fl_finetune(
                 client.terminate_local_training(
                     epoch, local_dataset_len_dict, previously_selected_clients_set
                 )
+                        
+            del client          # 删掉 GeneralClient，里面的 trainer / optimizer 也一并释放
+            del model_client    # 删掉这一轮的 client 模型引用
+            gc.collect()        # 触发 Python GC
+            torch.cuda.empty_cache()   # 把用不到的 cache 还给 CUDA 驱动
 
         # -----------------------------
         # server aggregation
