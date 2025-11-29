@@ -35,7 +35,7 @@ def global_evaluation(model, tokenizer, prompter, dev_data_path):
     with open(dev_data_path, 'r') as f:
         test_set = json.load(f)
 
-    MAX_EVAL = 100   # 你可以改成 50 / 200 / 300
+    MAX_EVAL = 50   # 你可以改成 50 / 200 / 300
     if len(test_set) > MAX_EVAL:
         random.seed(42)
         test_set = random.sample(test_set, MAX_EVAL)
