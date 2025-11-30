@@ -7,8 +7,13 @@ import fire
 import torch
 import copy
 import glob
+import itertools
 from tqdm.auto import tqdm
 import wandb
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Tuple
+import torch.nn.functional as F
 
 from transformers import (
     AutoModelForCausalLM,
@@ -40,6 +45,66 @@ def freeze_lora_A(model):
         if "lora_A" in n:
             p.requires_grad = False
 
+
+# ------------------------------------------------------------------
+# ⭐️ LoRA 向量提取和拼接函数 (您目前接受的版本)
+# ------------------------------------------------------------------
+def extract_lora_by_layer(model) -> Dict[str, Dict[int, torch.Tensor]]:
+    A_collected, B_collected = {}, {}
+    # 定义 LoRA 模块的固定顺序，确保所有客户端都以这个顺序拼接
+    FIXED_MODULE_ORDER = ["q_proj", "v_proj"]
+
+    for n, p in model.named_parameters():
+        if "lora_A" in n or "lora_B" in n:
+            parts = n.split(".")
+
+            try:
+                # 尝试通过字符串分割定位 layer ID
+                lid_idx = parts.index("layers") + 1
+                lid = int(parts[lid_idx])
+            except (ValueError, IndexError):
+                continue
+
+            # 提取模块名
+            module_name = next((t for t in FIXED_MODULE_ORDER if t in n), None)
+            if module_name is None:
+                continue
+
+            key = "A" if "lora_A" in n else "B"
+            vec = p.detach().cpu().flatten()
+
+            # 将向量存储在一个按层ID和模块名组织的字典中
+            if key == "A":
+                A_collected.setdefault(lid, {})[module_name] = vec
+            else:
+                B_collected.setdefault(lid, {})[module_name] = vec
+
+    def cat_in_fixed_order(collected_dict):
+        result = {}
+        for lid, module_map in collected_dict.items():
+            # 关键步骤：明确按照 FIXED_MODULE_ORDER 拼接向量
+            try:
+                vectors = [module_map[name] for name in FIXED_MODULE_ORDER]
+                result[lid] = torch.cat(vectors)
+            except KeyError:
+                # 如果某个模块缺失，跳过或记录错误
+                continue
+        return result
+
+    return {
+        "A": cat_in_fixed_order(A_collected),
+        "B": cat_in_fixed_order(B_collected)
+    }
+
+# ------------------------------------------------------------------
+# 以下是相似性计算和绘图代码
+# ------------------------------------------------------------------
+def mean_pairwise_cosine(vectors):
+    if len(vectors) < 2: return float("nan")
+    sims = []
+    for i,j in itertools.combinations(range(len(vectors)),2):
+        sims.append(F.cosine_similarity(vectors[i].unsqueeze(0), vectors[j].unsqueeze(0)).item())
+    return float(np.mean(sims))
 
 # ===========================================================
 # Main Federated Finetuning
@@ -142,6 +207,7 @@ def fl_finetune(
     local_dataset_len_dict = {}
     previously_selected_clients_set = set()
 
+    layer_stats = []
     # ===========================================================
     # Federated Rounds
     # ===========================================================
@@ -171,6 +237,7 @@ def fl_finetune(
             print("🔒 Freeze-A Phase")
 
         selected_clients = list(range(num_clients))
+        client_loras = []
 
         # -----------------------------
         # Local training
@@ -203,12 +270,15 @@ def fl_finetune(
                 client.terminate_local_training(
                     epoch, local_dataset_len_dict, previously_selected_clients_set
                 )
-                        
+            
+            client_loras.append(extract_lora_by_layer(model_client))
+            
+
             del client          # 删掉 GeneralClient，里面的 trainer / optimizer 也一并释放
             del model_client    # 删掉这一轮的 client 模型引用
             gc.collect()        # 触发 Python GC
             torch.cuda.empty_cache()   # 把用不到的 cache 还给 CUDA 驱动
-
+        
         # -----------------------------
         # server aggregation
         # -----------------------------
@@ -221,7 +291,23 @@ def fl_finetune(
             epoch,
             freezeA_phase=freezeA_phase,
         )
+        all_layers = sorted(set().union(*[set(d["A"].keys()) for d in client_loras]))
+        print("client_loras: ")
+        print(len(client_loras))
+        print(client_loras[-1])
 
+        for lid in all_layers:
+            A_vecs, B_vecs = [], []
+            for c in range(len(client_loras)):
+                if lid in client_loras[c]["A"]: A_vecs.append(client_loras[c]["A"][lid])
+                if lid in client_loras[c]["B"]: B_vecs.append(client_loras[c]["B"][lid])
+            layer_stats.append({
+                "communication_rounds": epoch,
+                "freeze_A_phase": freezeA_phase,
+                "layer": lid,
+                "A": mean_pairwise_cosine(A_vecs),
+                "B": mean_pairwise_cosine(B_vecs),
+            })
         # --------------------------------
         # DEBUG: print LoRA_B after FedAvg
         # --------------------------------
@@ -239,6 +325,9 @@ def fl_finetune(
         print(f"🌟 Acc of Round {epoch}: {acc}")
         wandb.log({"round": epoch, "accuracy": acc})
 
+    
+    df = pd.DataFrame(layer_stats)
+    df.to_csv(os.path.join(output_dir, f"pairwise_cosine_clients{num_clients}_rounds{num_communication_rounds}.csv"), index=False)
     print("🎉 FedIT Training Completed!")
 
 
